@@ -1,69 +1,57 @@
-/// Owned memory region
-struct Stack {
+// TODO: Implement stack guard page.
+pub(crate) struct Stack {
     bytes: Vec<u8>,
 }
 
 impl Stack {
-    fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         Stack {
             bytes: vec![0; size],
         }
     }
 
-    // return address of the first byte
-    fn bottom_addr(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn bottom_addr(&self) -> usize {
         self.bytes.as_ptr() as usize
     }
 
-    fn top_addr(&self) -> usize {
+    pub(crate) fn top_addr(&self) -> usize {
         self.bottom_addr() + self.bytes.len()
     }
 
-    fn aligned_top(&self) -> usize {
+    pub(crate) fn aligned_top(&self) -> usize {
         let top_addr = self.top_addr();
         top_addr - (top_addr % 16)
     }
 }
 
-// TODO: This is Apple Silicon hide it behind a feature flag
-// Reference: https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct Context {
-    /// Stack pointer.
-    pub sp: usize,
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Callee-saved general-purpose registers.
-    pub x19: usize,
-    pub x20: usize,
-    pub x21: usize,
-    pub x22: usize,
-    pub x23: usize,
-    pub x24: usize,
-    pub x25: usize,
-    pub x26: usize,
-    pub x27: usize,
-    pub x28: usize,
+    #[test]
+    fn stack_allocates_requested_zeroed_memory() {
+        let stack = Stack::new(256);
 
-    /// Frame pointer.
-    pub x29: usize,
+        assert_eq!(stack.bytes.len(), 256);
+        assert!(stack.bytes.iter().all(|byte| *byte == 0));
+    }
 
-    /// Link register / return address.
-    pub x30: usize,
-}
+    #[test]
+    fn stack_addresses_describe_owned_memory_region() {
+        let stack = Stack::new(257);
+        let bottom_addr = stack.bottom_addr();
+        let top_addr = stack.top_addr();
+        let aligned_top = stack.aligned_top();
 
-impl Context {
-    fn new(stack: &Stack, entry_addr: usize) -> Context {
-        Context {
-            sp: stack.top_addr(),
-            x30: entry_addr,
-            ..Context::default()
-        }
+        assert_eq!(top_addr, bottom_addr + stack.bytes.len());
+        assert!(bottom_addr < top_addr);
+        assert!(bottom_addr <= aligned_top);
+        assert!(aligned_top <= top_addr);
+        assert_eq!(aligned_top % 16, 0);
+        assert!(top_addr - aligned_top < 16);
     }
 }
-
-fn add(a: i32, b: i32) -> i32 {
-    a + b
-}
-
-fn create_context(func: &dyn FnOnce() -> ()) {}
