@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::{
-    context::Context,
+    context::{Context, bootstrap_entry_addr, switch},
     routine::{RoutineState, RsRoutine},
 };
 
@@ -15,23 +15,41 @@ impl RoutineId {
 }
 
 pub(crate) struct Scheduler {
-    //context: Context,
-    routines: Vec<RsRoutine>,
+    context: Context,
+    routines: Vec<Box<RsRoutine>>,
     run_queue: VecDeque<RoutineId>,
 }
 
 impl Scheduler {
     pub(crate) fn new() -> Self {
         Self {
-            //context: Context::new(stack, entry_addr)
+            context: Context::default(),
             routines: Vec::new(),
             run_queue: VecDeque::new(),
         }
     }
 
+    pub fn run(&mut self) {
+        while let Some(routine_id) = self.next() {
+            let context = &mut self.context;
+            let routines = &self.routines;
+
+            let routine = routines
+                .get(routine_id.inner())
+                .expect("queued routine must exist")
+                .as_ref();
+
+            unsafe {
+                switch(context, &routine.context);
+            }
+        }
+    }
+
     pub(crate) fn spawn(&mut self, func: Box<dyn FnOnce() + Send + 'static>) -> RoutineId {
-        let routine = RsRoutine::new(func);
+        let entry_addr = bootstrap_entry_addr();
+        let mut routine = Box::new(RsRoutine::new(func, entry_addr));
         let routine_id = RoutineId(self.routines.len());
+        routine.initialize_bootstrap(&mut self.context as *mut Context);
         self.routines.push(routine);
         self.run_queue.push_back(routine_id);
         routine_id
@@ -59,17 +77,21 @@ impl Scheduler {
     }
 
     pub(crate) fn routine(&self, routine: RoutineId) -> Option<&RsRoutine> {
-        self.routines.get(routine.inner())
+        self.routines.get(routine.inner()).map(Box::as_ref)
     }
 
     pub(crate) fn routine_mut(&mut self, routine: RoutineId) -> Option<&mut RsRoutine> {
-        self.routines.get_mut(routine.inner())
+        self.routines.get_mut(routine.inner()).map(Box::as_mut)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn scheduler_new_starts_empty() {
@@ -156,5 +178,25 @@ mod tests {
             .routine(routine_id)
             .expect("spawned routine must be stored");
         assert_eq!(routine.state(), RoutineState::Running);
+    }
+
+    #[test]
+    fn scheduler_run_executes_spawned_routine_to_completion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_routine = Arc::clone(&calls);
+        let mut scheduler = Scheduler::new();
+
+        let routine_id = scheduler.spawn(Box::new(move || {
+            calls_for_routine.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        scheduler.run();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scheduler.get_state(routine_id),
+            Some(RoutineState::Finished)
+        );
+        assert!(scheduler.run_queue.is_empty());
     }
 }

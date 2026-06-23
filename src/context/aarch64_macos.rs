@@ -1,6 +1,7 @@
 use crate::stack::Stack;
 
-// TODO: This is Apple Silicon. Keep platform-specific register layouts in this module.
+core::arch::global_asm!(include_str!("../asm/aarch_macos.S"));
+
 // Reference: https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -41,7 +42,20 @@ impl Context {
 }
 
 unsafe extern "C" {
-    pub fn swap_context(from: *mut Context, to: *const Context);
+    fn swap_context(from: *mut Context, to: *const Context);
+    fn bootstrap_entry() -> !;
+}
+
+pub(crate) fn bootstrap_entry_addr() -> usize {
+    bootstrap_entry as *const () as usize
+}
+
+pub(crate) unsafe fn switch(from: &mut Context, to: &Context) {
+    // SAFETY: The caller guarantees that both references point to valid Context values, that
+    // `to.sp` points to a valid stack, and that `to.x30` points to executable code.
+    unsafe {
+        swap_context(from as *mut Context, to as *const Context);
+    }
 }
 
 #[cfg(test)]

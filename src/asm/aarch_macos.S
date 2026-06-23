@@ -23,3 +23,10 @@ ldp x27, x28, [x1, #72]
 ldp x29, x30, [x1, #88]
 // Return 
 br x30
+
+.globl _bootstrap_entry
+.p2align 2
+_bootstrap_entry:
+mov x0, x19
+mov x1, x20
+br x21
