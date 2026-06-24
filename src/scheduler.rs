@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::ptr::NonNull;
 
 use crate::{
     context::{Context, bootstrap_entry_addr, switch},
@@ -14,10 +16,15 @@ impl RoutineId {
     }
 }
 
+thread_local! {
+    pub static CURRENT_SCHEDULER: Cell<Option<NonNull<Scheduler>>> = const { Cell::new(None) };
+}
+
 pub(crate) struct Scheduler {
     context: Context,
     routines: Vec<Box<RsRoutine>>,
     run_queue: VecDeque<RoutineId>,
+    current: Option<RoutineId>,
 }
 
 impl Scheduler {
@@ -26,13 +33,19 @@ impl Scheduler {
             context: Context::default(),
             routines: Vec::new(),
             run_queue: VecDeque::new(),
+            current: None,
         }
     }
 
     pub fn run(&mut self) {
+        let current_pointer = self as *mut Self;
+        CURRENT_SCHEDULER.set(Some(
+            NonNull::new(current_pointer).expect("This won't be null"),
+        ));
         while let Some(routine_id) = self.next() {
             let context = &mut self.context;
             let routines = &self.routines;
+            self.current = Some(routine_id);
 
             let routine = routines
                 .get(routine_id.inner())
@@ -42,7 +55,9 @@ impl Scheduler {
             unsafe {
                 switch(context, &routine.context);
             }
+            self.current = None;
         }
+        CURRENT_SCHEDULER.set(None);
     }
 
     pub(crate) fn spawn(&mut self, func: Box<dyn FnOnce() + Send + 'static>) -> RoutineId {
@@ -83,13 +98,26 @@ impl Scheduler {
     pub(crate) fn routine_mut(&mut self, routine: RoutineId) -> Option<&mut RsRoutine> {
         self.routines.get_mut(routine.inner()).map(Box::as_mut)
     }
+
+    pub(crate) fn yield_current(&mut self) {
+        if let Some(routine_id) = self.current {
+            self.run_queue.push_back(routine_id);
+            let routines = &mut self.routines;
+            let context = &self.context;
+            let routine = routines.get_mut(routine_id.inner()).unwrap();
+            routine.set_state(RoutineState::Runnable);
+            unsafe {
+                switch(&mut routine.context, context);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -197,6 +225,54 @@ mod tests {
             scheduler.get_state(routine_id),
             Some(RoutineState::Finished)
         );
+        assert!(scheduler.run_queue.is_empty());
+    }
+
+    #[test]
+    fn scheduler_run_interleaves_routines_when_they_yield() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_first = Arc::clone(&events);
+        let events_for_second = Arc::clone(&events);
+        let mut scheduler = Scheduler::new();
+
+        let first_id = scheduler.spawn(Box::new(move || {
+            events_for_first
+                .lock()
+                .expect("event log mutex must not be poisoned")
+                .push("first before yield");
+            crate::yield_now();
+            events_for_first
+                .lock()
+                .expect("event log mutex must not be poisoned")
+                .push("first after yield");
+        }));
+
+        let second_id = scheduler.spawn(Box::new(move || {
+            events_for_second
+                .lock()
+                .expect("event log mutex must not be poisoned")
+                .push("second before yield");
+            crate::yield_now();
+            events_for_second
+                .lock()
+                .expect("event log mutex must not be poisoned")
+                .push("second after yield");
+        }));
+
+        scheduler.run();
+
+        let events = events.lock().expect("event log mutex must not be poisoned");
+        assert_eq!(
+            &*events,
+            &[
+                "first before yield",
+                "second before yield",
+                "first after yield",
+                "second after yield"
+            ]
+        );
+        assert_eq!(scheduler.get_state(first_id), Some(RoutineState::Finished));
+        assert_eq!(scheduler.get_state(second_id), Some(RoutineState::Finished));
         assert!(scheduler.run_queue.is_empty());
     }
 }

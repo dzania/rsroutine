@@ -22,10 +22,10 @@ pub(crate) struct RsRoutine {
 }
 
 impl RsRoutine {
-    pub(crate) fn new(func: Box<dyn FnOnce() + Send + 'static>, entry_addr: usize) -> Self {
+    pub(crate) fn new(func: Box<dyn FnOnce() + Send + 'static>, bootstrap_addr: usize) -> Self {
         let func = Func::new(func);
         let stack = Stack::new(DEFAULT_STACK_SIZE);
-        let context = Context::new(&stack, entry_addr);
+        let context = Context::new_routine(&stack, bootstrap_addr);
 
         Self {
             state: RoutineState::Runnable,

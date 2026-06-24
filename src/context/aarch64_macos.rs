@@ -29,13 +29,13 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    pub(crate) fn new(stack: &Stack, entry_addr: usize) -> Context {
+    pub(crate) fn new_routine(stack: &Stack, bootstrap_addr: usize) -> Context {
         let aligned_top = stack.aligned_top();
 
         Context {
             sp: aligned_top,
             x29: aligned_top,
-            x30: entry_addr,
+            x30: bootstrap_addr,
             ..Context::default()
         }
     }
@@ -66,7 +66,7 @@ mod tests {
     fn context_initializes_stack_registers_and_entry_address() {
         let stack = Stack::new(1024);
         let entry_addr = 0x1234_5678;
-        let context = Context::new(&stack, entry_addr);
+        let context = Context::new_routine(&stack, entry_addr);
 
         assert_eq!(context.sp, stack.aligned_top());
         assert_eq!(context.x29, stack.aligned_top());
