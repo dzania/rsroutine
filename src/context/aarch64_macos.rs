@@ -26,6 +26,14 @@ pub(crate) struct Context {
 
     /// Link register / return address.
     pub(crate) x30: usize,
+    pub(crate) d8: u64,
+    pub(crate) d9: u64,
+    pub(crate) d10: u64,
+    pub(crate) d11: u64,
+    pub(crate) d12: u64,
+    pub(crate) d13: u64,
+    pub(crate) d14: u64,
+    pub(crate) d15: u64,
 }
 
 impl Context {
@@ -50,11 +58,11 @@ pub(crate) fn bootstrap_entry_addr() -> usize {
     bootstrap_entry as *const () as usize
 }
 
-pub(crate) unsafe fn switch(from: &mut Context, to: &Context) {
+pub(crate) fn switch(from: *mut Context, to: *const Context) {
     // SAFETY: The caller guarantees that both references point to valid Context values, that
     // `to.sp` points to a valid stack, and that `to.x30` points to executable code.
     unsafe {
-        swap_context(from as *mut Context, to as *const Context);
+        swap_context(from, to);
     }
 }
 

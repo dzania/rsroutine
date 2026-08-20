@@ -13,6 +13,7 @@ impl Func {
 
     pub(crate) fn call_once(&mut self) {
         // TODO: Do not use expect.
+        // And add catch_unwind
         let inner = self
             .inner
             .take()

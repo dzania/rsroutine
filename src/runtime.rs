@@ -4,23 +4,43 @@ use crossbeam_deque::Stealer;
 use crossbeam_deque::Worker as LocalQueue;
 use rand::random_range;
 use std::cell::Cell;
+use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::LazyLock;
 use std::thread;
-use std::thread::sleep;
-use std::time::Duration;
 
 use crate::context::Context;
 use crate::context::switch;
-use crate::routine::RoutineState;
 use crate::routine::RsRoutine;
 
 thread_local! {
     static WORKER: Cell<Option<NonNull<Worker>>> = Cell::new(None);
 }
 
+enum RunOutcome {
+    Yielded,
+    /// ParkRequest(ParkRequest)
+    /// TODO: Completed(Result<T, E>)
+    Completed,
+}
+
+/// `Wrapper around the routine Pin<Box<RsRoutine>>` keeps the routine from moving.
+struct Task {
+    routine: Pin<Box<RsRoutine>>,
+    outcome: Option<RunOutcome>,
+}
+
+impl Task {
+    fn new(routine: Pin<Box<RsRoutine>>) -> Self {
+        Self {
+            routine,
+            outcome: None,
+        }
+    }
+}
+
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    let incoming_queue: GlobalQueue<RsRoutine> = GlobalQueue::new();
+    let incoming_queue = GlobalQueue::new();
     let num_workers = num_cpus::get().max(1);
     let mut stealers = Vec::with_capacity(num_workers);
     for i in 0..num_workers {
@@ -44,15 +64,15 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
 
 struct Runtime {
     worker_count: usize,
-    incoming_queue: GlobalQueue<RsRoutine>,
-    stealers: Vec<Stealer<RsRoutine>>,
+    incoming_queue: GlobalQueue<Task>,
+    stealers: Vec<Stealer<Task>>,
 }
 
 impl Runtime {
     fn new(
         worker_count: usize,
-        incoming_queue: GlobalQueue<RsRoutine>,
-        stealers: Vec<Stealer<RsRoutine>>,
+        incoming_queue: GlobalQueue<Task>,
+        stealers: Vec<Stealer<Task>>,
     ) -> Self {
         Self {
             worker_count,
@@ -66,16 +86,16 @@ struct WorkerId(usize);
 
 struct Worker {
     id: WorkerId,
-    local_queue: LocalQueue<RsRoutine>,
+    local_queue: LocalQueue<Task>,
     // Worker context
     context: Context,
-    current: Option<RsRoutine>,
+    current: Option<Task>,
 }
 
 impl Worker {
-    fn find_routine(&mut self) -> Option<RsRoutine> {
-        if let Some(routine) = self.local_queue.pop() {
-            return Some(routine);
+    fn find_task(&mut self) -> Option<Task> {
+        if let Some(task) = self.local_queue.pop() {
+            return Some(task);
         }
 
         loop {
@@ -83,20 +103,20 @@ impl Worker {
                 .incoming_queue
                 .steal_batch_and_pop(&self.local_queue)
             {
-                Steal::Success(routine) => return Some(routine),
+                Steal::Success(task) => return Some(task),
                 Steal::Retry => continue,
                 Steal::Empty => {}
             }
 
             match self.steal_from_workers() {
-                Steal::Success(routine) => return Some(routine),
+                Steal::Success(task) => return Some(task),
                 Steal::Retry => continue,
                 Steal::Empty => return None,
             }
         }
     }
 
-    fn steal_from_workers(&self) -> Steal<RsRoutine> {
+    fn steal_from_workers(&self) -> Steal<Task> {
         let len = RUNTIME.stealers.len();
         if len <= 1 {
             return Steal::Empty;
@@ -117,36 +137,50 @@ impl Worker {
             .collect()
     }
 
-    // Find next routine to run
+    fn yield_now(&mut self) {
+        let mut task = self.current.take().expect("No task to yield");
+        let to = &raw mut self.context;
+        task.outcome = None;
+        // TODO: Encapsulate this inside RsRoutine
+        let from = unsafe { task.routine.as_mut().get_unchecked_mut() };
+        switch(&raw mut from.context, to);
+        task.outcome = Some(RunOutcome::Yielded)
+    }
+
+    // Find next routine to run then execvute
     fn poll(&mut self) {
         loop {
-            if let Some(mut routine) = self.find_routine() {
-                routine.set_state(RoutineState::Running);
-                self.current = Some(routine);
-                /// FIXME: UB
-                unsafe {
-                    debug_assert!(self.current.is_some());
-                    let routine = self.current.as_ref().expect("Expected routine");
-                    switch(&mut self.context, &routine.context);
-                };
-                let routine = self.current.take();
-                debug_assert!(routine.is_some());
-                match routine.as_ref().unwrap().state() {
-                    RoutineState::Runnable => {
-                        self.local_queue.push(routine.unwrap());
-                    }
-                    RoutineState::Finished => {
-                        drop(routine);
-                    }
-                    RoutineState::Running => {
-                        unreachable!()
-                    }
-                    RoutineState::Parked => {}
-                }
-            } else {
-                // FIXME: Yield thread here or park
-                sleep(Duration::from_millis(100));
+            let Some(task) = self.find_task() else {
+                // TODO: Park here whatever da fuck it means
                 continue;
+            };
+
+            self.current = Some(task);
+
+            let to = {
+                let task = self
+                    .current
+                    .as_ref()
+                    .expect("current task must exist during dispatch");
+
+                let routine = task.routine.as_ref().get_ref();
+                &raw const routine.context
+            };
+
+            let from = &raw mut self.context;
+
+            switch(from, to);
+
+            // Execution reaches here only after the routine switches back.
+            let mut task = self
+                .current
+                .take()
+                .expect("current task must exist after dispatch");
+
+            match task.outcome.take() {
+                Some(RunOutcome::Yielded) => self.local_queue.push(task),
+                Some(RunOutcome::Completed) => drop(task),
+                None => panic!("routine switched back without reporting an outcome"),
             }
         }
     }
