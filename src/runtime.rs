@@ -47,14 +47,15 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         let local_queue = LocalQueue::new_fifo();
         stealers.push(local_queue.stealer());
         thread::spawn(move || {
-            let mut worker = Worker {
+            let mut worker = Box::new(Worker {
                 id: WorkerId(i),
                 local_queue,
                 context: Context::default(),
                 current: None,
-            };
-            WORKER.set(Some(NonNull::from(&mut worker)));
-            worker.poll();
+            });
+            let worker_ptr = NonNull::from(worker.as_mut());
+            WORKER.set(Some(worker_ptr));
+            Worker::poll(worker_ptr);
             // if worker ever quits we should clean the pointer
             WORKER.set(None);
         });
@@ -90,6 +91,31 @@ struct Worker {
     // Worker context
     context: Context,
     current: Option<Task>,
+}
+
+fn suspend_current(outcome: RunOutcome) {
+    let worker_ptr = WORKER.with(|slot| {
+        slot.get()
+            .expect("yield_now called outside runtime")
+            .as_ptr()
+    });
+    let (from, to) = unsafe {
+        let worker = &mut *worker_ptr;
+        let task = worker.current.as_mut().expect("no running task to suspend");
+        assert!(task.outcome.replace(outcome).is_none());
+        let routine = task.routine.as_mut().get_unchecked_mut();
+        (&raw mut routine.context, &raw const worker.context)
+    };
+    switch(from, to);
+}
+
+pub fn yield_now() {
+    suspend_current(RunOutcome::Yielded);
+}
+
+pub(crate) fn complete_current() -> ! {
+    suspend_current(RunOutcome::Completed);
+    unreachable!("completed task was resumed");
 }
 
 impl Worker {
@@ -137,51 +163,82 @@ impl Worker {
             .collect()
     }
 
-    fn yield_now(&mut self) {
-        let mut task = self.current.take().expect("No task to yield");
-        let to = &raw mut self.context;
-        task.outcome = None;
-        // TODO: Encapsulate this inside RsRoutine
-        let from = unsafe { task.routine.as_mut().get_unchecked_mut() };
-        switch(&raw mut from.context, to);
-        task.outcome = Some(RunOutcome::Yielded)
-    }
+    // Find next routine to run then execute
+    fn poll(worker: NonNull<Self>) {
+        let worker_ptr = worker.as_ptr();
 
-    // Find next routine to run then execvute
-    fn poll(&mut self) {
         loop {
-            let Some(task) = self.find_task() else {
-                // TODO: Park here whatever da fuck it means
+            let task = {
+                let worker = unsafe { &mut *worker_ptr };
+                worker.find_task()
+            };
+
+            let Some(task) = task else {
+                thread::park();
                 continue;
             };
 
-            self.current = Some(task);
-
-            let to = {
-                let task = self
-                    .current
-                    .as_ref()
-                    .expect("current task must exist during dispatch");
-
-                let routine = task.routine.as_ref().get_ref();
-                &raw const routine.context
-            };
-
-            let from = &raw mut self.context;
-
-            switch(from, to);
-
-            // Execution reaches here only after the routine switches back.
-            let mut task = self
-                .current
-                .take()
-                .expect("current task must exist after dispatch");
-
-            match task.outcome.take() {
-                Some(RunOutcome::Yielded) => self.local_queue.push(task),
-                Some(RunOutcome::Completed) => drop(task),
-                None => panic!("routine switched back without reporting an outcome"),
-            }
+            Self::dispatch(worker, task);
         }
+    }
+
+    fn dispatch(worker: NonNull<Self>, task: Task) {
+        let worker_ptr = worker.as_ptr();
+        let (from, to) = {
+            let worker = unsafe { &mut *worker_ptr };
+
+            worker.current = Some(task);
+
+            let task = worker.current.as_ref().expect("current task must exist");
+            assert!(task.outcome.is_none());
+
+            let routine = task.routine.as_ref().get_ref();
+            (&raw mut worker.context, &raw const routine.context)
+        };
+
+        switch(from, to);
+
+        let worker = unsafe { &mut *worker_ptr };
+        let mut task = worker
+            .current
+            .take()
+            .expect("current task must exist after dispatch");
+
+        match task.outcome.take() {
+            Some(RunOutcome::Yielded) => worker.local_queue.push(task),
+            Some(RunOutcome::Completed) => drop(task),
+            None => panic!("routine returned without an outcome"),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn run_test_tasks(tasks: Vec<Box<dyn FnOnce() + Send + 'static>>) {
+    struct WorkerTlsGuard;
+
+    impl Drop for WorkerTlsGuard {
+        fn drop(&mut self) {
+            WORKER.set(None);
+        }
+    }
+
+    let local_queue = LocalQueue::new_fifo();
+    for task in tasks {
+        let routine = RsRoutine::new_pinned(task, crate::context::bootstrap_entry_addr());
+        local_queue.push(Task::new(routine));
+    }
+
+    let mut worker = Box::new(Worker {
+        id: WorkerId(0),
+        local_queue,
+        context: Context::default(),
+        current: None,
+    });
+    let worker_ptr = NonNull::from(worker.as_mut());
+    WORKER.set(Some(worker_ptr));
+    let _guard = WorkerTlsGuard;
+
+    while let Some(task) = worker.local_queue.pop() {
+        Worker::dispatch(worker_ptr, task);
     }
 }

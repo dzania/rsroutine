@@ -1,11 +1,7 @@
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 
-use crate::{
-    context::{Context, switch},
-    func::Func,
-    stack::Stack,
-};
+use crate::{context::Context, func::Func, stack::Stack};
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 32 * 1024;
 
@@ -48,23 +44,19 @@ impl RsRoutine {
         let routine_ref: &mut RsRoutine = unsafe { Pin::get_unchecked_mut(self) };
         let routine_ptr: *mut RsRoutine = routine_ref as *mut RsRoutine;
         routine_ref.context.x19 = routine_ptr as usize;
-        routine_ref.context.x21 = routine_entry as usize;
+        routine_ref.context.x21 = routine_entry as *const () as usize;
     }
 }
 
-extern "C" fn routine_entry(routine: *mut RsRoutine, scheduler_context: *mut Context) -> ! {
+extern "C" fn routine_entry(routine: *mut RsRoutine) -> ! {
     // SAFETY: `initialize_bootstrap` stores a valid pointer to the boxed routine before the
     // routine can be started.
-    let routine = unsafe { &mut *routine };
-    routine.func.call_once();
-
-    // SAFETY: `initialize_bootstrap` stores a valid scheduler context pointer in x20, and the
-    // scheduler context outlives every routine it starts.
-    unsafe {
-        switch(&mut routine.context, &*scheduler_context);
+    {
+        let func = unsafe { &mut (*routine).func };
+        func.call_once();
     }
 
-    unreachable!("finished routine resumed after switching back to scheduler")
+    crate::runtime::complete_current()
 }
 
 #[cfg(test)]
