@@ -1,5 +1,4 @@
 mod context;
-mod func;
 mod routine;
 mod runtime;
 mod stack;
@@ -54,11 +53,13 @@ mod tests {
         let task_observed = Arc::clone(&observed);
 
         runtime::run_test_tasks(vec![Box::new(move || {
-            let value = 41;
+            let mut value = std::hint::black_box(vec![40, 2]);
             yield_now();
-            *task_observed.lock().unwrap() = Some(value + 1);
+            value[0] += 1;
+            yield_now();
+            *task_observed.lock().unwrap() = Some(value);
         })]);
 
-        assert_eq!(*observed.lock().unwrap(), Some(42));
+        assert_eq!(*observed.lock().unwrap(), Some(vec![41, 2]));
     }
 }

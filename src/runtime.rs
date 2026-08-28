@@ -214,11 +214,11 @@ impl Worker {
 
 #[cfg(test)]
 pub(crate) fn run_test_tasks(tasks: Vec<Box<dyn FnOnce() + Send + 'static>>) {
-    struct WorkerTlsGuard;
+    struct WorkerTlsGuard(Option<NonNull<Worker>>);
 
     impl Drop for WorkerTlsGuard {
         fn drop(&mut self) {
-            WORKER.set(None);
+            WORKER.set(self.0);
         }
     }
 
@@ -235,8 +235,12 @@ pub(crate) fn run_test_tasks(tasks: Vec<Box<dyn FnOnce() + Send + 'static>>) {
         current: None,
     });
     let worker_ptr = NonNull::from(worker.as_mut());
-    WORKER.set(Some(worker_ptr));
-    let _guard = WorkerTlsGuard;
+    let previous_worker = WORKER.replace(Some(worker_ptr));
+    let _guard = WorkerTlsGuard(previous_worker);
+    assert!(
+        previous_worker.is_none(),
+        "nested test runtimes are unsupported"
+    );
 
     while let Some(task) = worker.local_queue.pop() {
         Worker::dispatch(worker_ptr, task);

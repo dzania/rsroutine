@@ -1,25 +1,24 @@
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 
-use crate::{context::Context, func::Func, stack::Stack};
+use crate::{context::Context, stack::Stack};
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 32 * 1024;
 
 pub(crate) struct RsRoutine {
     stack: Stack,
     pub(crate) context: Context,
-    func: Func,
+    func: Option<Box<dyn FnOnce() + Send + 'static>>,
     _unpin: PhantomPinned,
 }
 
 impl RsRoutine {
     fn new(func: Box<dyn FnOnce() + Send + 'static>, bootstrap_addr: usize) -> Self {
-        let func = Func::new(func);
         let stack = Stack::new(DEFAULT_STACK_SIZE);
         let context = Context::new_routine(&stack, bootstrap_addr);
 
         Self {
-            func,
+            func: Some(func),
             stack,
             context,
             _unpin: PhantomPinned,
@@ -51,10 +50,13 @@ impl RsRoutine {
 extern "C" fn routine_entry(routine: *mut RsRoutine) -> ! {
     // SAFETY: `initialize_bootstrap` stores a valid pointer to the boxed routine before the
     // routine can be started.
-    {
-        let func = unsafe { &mut (*routine).func };
-        func.call_once();
-    }
+    let func = unsafe {
+        (*routine)
+            .func
+            .take()
+            .expect("routine function must exist on first entry")
+    };
+    func();
 
     crate::runtime::complete_current()
 }
@@ -72,6 +74,6 @@ mod tests {
         assert_eq!(routine.context.sp, routine.stack.aligned_top());
         assert_eq!(routine.context.x29, routine.stack.aligned_top());
         assert_eq!(routine.context.x30, bootstrap_entry_addr());
-        assert!(routine.func.is_pending());
+        assert!(routine.func.is_some());
     }
 }
