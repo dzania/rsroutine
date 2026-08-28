@@ -3,13 +3,20 @@ mod routine;
 mod runtime;
 mod stack;
 
-pub use runtime::yield_now;
+pub use runtime::{spawn, yield_now};
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        rc::Rc,
+        sync::{Arc, Mutex, mpsc},
+        thread,
+        time::Duration,
+    };
 
     use super::*;
+
+    static GLOBAL_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     #[should_panic(expected = "yield_now called outside runtime")]
@@ -61,5 +68,67 @@ mod tests {
         })]);
 
         assert_eq!(*observed.lock().unwrap(), Some(vec![41, 2]));
+    }
+
+    #[test]
+    fn panicking_task_does_not_escape_the_routine_entrypoint() {
+        let completed = Arc::new(Mutex::new(false));
+        let task_completed = Arc::clone(&completed);
+
+        runtime::run_test_tasks(vec![
+            Box::new(|| panic!("expected task panic")),
+            Box::new(move || *task_completed.lock().unwrap() = true),
+        ]);
+
+        assert!(*completed.lock().unwrap());
+    }
+
+    #[test]
+    fn yielded_task_stays_on_its_original_worker() {
+        let _guard = GLOBAL_RUNTIME_TEST_LOCK.lock().unwrap();
+        runtime::wait_until_all_workers_idle(Duration::from_secs(2));
+
+        let (sender, receiver) = mpsc::channel();
+        spawn(move || {
+            let original_thread = thread::current().id();
+            let non_send_local = Rc::new(42);
+
+            for _ in 0..32 {
+                yield_now();
+                assert_eq!(thread::current().id(), original_thread);
+                assert_eq!(*non_send_local, 42);
+            }
+
+            sender.send(()).unwrap();
+        });
+
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        runtime::wait_until_all_workers_idle(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn spawn_wakes_a_parked_worker() {
+        let _guard = GLOBAL_RUNTIME_TEST_LOCK.lock().unwrap();
+        for _ in 0..16 {
+            runtime::wait_until_all_workers_idle(Duration::from_secs(2));
+
+            let (sender, receiver) = mpsc::channel();
+            spawn(move || {
+                sender.send("before").unwrap();
+                yield_now();
+                sender.send("after").unwrap();
+            });
+
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+                "before"
+            );
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+                "after"
+            );
+        }
+
+        runtime::wait_until_all_workers_idle(Duration::from_secs(2));
     }
 }
