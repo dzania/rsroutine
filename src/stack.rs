@@ -10,6 +10,7 @@ impl Stack {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.bytes.len()
     }

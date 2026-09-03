@@ -6,4 +6,3 @@ edition = "2024"
 [dependencies]
 crossbeam-deque = "0.8.6"
 num_cpus = "1.17.0"
-rand = "0.10.1"
