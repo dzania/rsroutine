@@ -2,8 +2,10 @@ use crossbeam_deque::Injector as GlobalQueue;
 use crossbeam_deque::Steal;
 use crossbeam_deque::Worker as LocalQueue;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 
@@ -15,15 +17,31 @@ thread_local! {
     static WORKER: Cell<Option<NonNull<Worker>>> = const { Cell::new(None) };
 }
 
+//static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
+
 enum RunOutcome {
+    // Task yielded and can be immediately run again
     Yielded,
-    /// ParkRequest(ParkRequest)
-    /// TODO: publish this result through a JoinHandle.
+    // Task remains unavailable until an unpark permit exists
+    ParkRequest(ParkRequest),
+    // TODO: publish this result through a JoinHandle.
     Completed(std::thread::Result<()>),
+}
+
+struct ParkRequest {}
+
+struct TaskId(u64);
+
+impl TaskId {
+    pub(crate) fn new() -> Self {
+        let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        TaskId(id)
+    }
 }
 
 /// `Wrapper around the routine Pin<Box<RsRoutine>>` keeps the routine from moving.
 struct Task {
+    id: TaskId,
     routine: Pin<Box<RsRoutine>>,
     outcome: Option<RunOutcome>,
 }
@@ -31,6 +49,7 @@ struct Task {
 impl Task {
     fn new(routine: Pin<Box<RsRoutine>>) -> Self {
         Self {
+            id: TaskId::new(),
             routine,
             outcome: None,
         }
@@ -50,6 +69,7 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
                 tick: 0,
                 context: Context::default(),
                 current: None,
+                parked: HashMap::new(),
             });
             let worker_ptr = NonNull::from(worker.as_mut());
             WORKER.set(Some(worker_ptr));
@@ -164,13 +184,14 @@ impl IdleWorkers {
 struct Worker {
     id: WorkerId,
     // This queue is deliberately private: once a task starts, values created on its stack need
-    // not be `Send`, so a yielded task must resume on the same OS thread.
+    // not be `Send`, so a yielded or parked task must resume on the same OS thread.
     local_queue: LocalQueue<Task>,
     // Alternate queue priority so neither new tasks nor yielded continuations can starve.
     tick: u32,
     // Worker context
     context: Context,
     current: Option<Task>,
+    parked: HashMap<TaskId, Task>,
 }
 
 fn suspend_current(outcome: RunOutcome) {
@@ -232,37 +253,30 @@ impl Worker {
         }
     }
 
+    fn park_if_idle(&mut self) -> Option<Task> {
+        RUNTIME.register_idle(self.id);
+
+        let task = self.find_task();
+
+        if task.is_none() {
+            thread::park();
+        }
+
+        RUNTIME.cancel_idle(self.id);
+        task
+    }
+
     // Find next routine to run then execute
     fn poll(worker: NonNull<Self>) {
         let worker_ptr = worker.as_ptr();
-        let worker_id = unsafe { (*worker_ptr).id };
-
         loop {
             let task = {
                 let worker = unsafe { &mut *worker_ptr };
-                worker.find_task()
+                worker.find_task().or_else(|| worker.park_if_idle())
             };
-
-            let Some(task) = task else {
-                RUNTIME.register_idle(worker_id);
-
-                let task = {
-                    let worker = unsafe { &mut *worker_ptr };
-                    worker.find_task()
-                };
-
-                if let Some(task) = task {
-                    RUNTIME.cancel_idle(worker_id);
-                    Self::dispatch(worker, task);
-                    continue;
-                }
-
-                thread::park();
-                RUNTIME.cancel_idle(worker_id);
-                continue;
-            };
-
-            Self::dispatch(worker, task);
+            if let Some(task) = task {
+                Self::dispatch(worker, task);
+            }
         }
     }
 
@@ -291,9 +305,9 @@ impl Worker {
         match task.outcome.take() {
             Some(RunOutcome::Yielded) => worker.local_queue.push(task),
             Some(RunOutcome::Completed(result)) => {
-                drop(task);
                 Self::discard_result(result);
             }
+            Some(RunOutcome::ParkRequest(_)) => {}
             None => panic!("routine returned without an outcome"),
         }
     }

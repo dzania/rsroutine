@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 crossbeam-deque = "0.8.6"
+mio = {version = "1.2.3", featurs = ['os-poll', 'net']}
 num_cpus = "1.17.0"
