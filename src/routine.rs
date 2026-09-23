@@ -1,20 +1,24 @@
-use std::marker::PhantomPinned;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::Pin;
+use std::{
+    marker::PhantomPinned,
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
+};
 
 use crate::{context::Context, stack::Stack};
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 32 * 1024;
 
+pub(crate) type RunnableFn = Box<dyn FnOnce() + Send + 'static>;
+
 pub(crate) struct RsRoutine {
     _stack: Stack,
     pub(crate) context: Context,
-    func: Option<Box<dyn FnOnce() + Send + 'static>>,
+    func: Option<RunnableFn>,
     _unpin: PhantomPinned,
 }
 
 impl RsRoutine {
-    fn new(func: Box<dyn FnOnce() + Send + 'static>, bootstrap_addr: usize) -> Self {
+    fn new(func: RunnableFn, bootstrap_addr: usize) -> Self {
         let stack = Stack::new(DEFAULT_STACK_SIZE);
         let context = Context::new_routine(&stack, bootstrap_addr);
 
@@ -26,10 +30,7 @@ impl RsRoutine {
         }
     }
 
-    pub(crate) fn new_pinned(
-        func: Box<dyn FnOnce() + Send + 'static>,
-        bootstrap_addr: usize,
-    ) -> Pin<Box<Self>> {
+    pub(crate) fn new_pinned(func: RunnableFn, bootstrap_addr: usize) -> Pin<Box<Self>> {
         let mut routine = Box::pin(Self::new(func, bootstrap_addr));
         {
             let routine_mut_ref = routine.as_mut();
