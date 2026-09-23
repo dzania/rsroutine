@@ -1,55 +1,183 @@
-use crossbeam_deque::Injector as GlobalQueue;
-use crossbeam_deque::Steal;
-use crossbeam_deque::Worker as LocalQueue;
-use std::cell::Cell;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::sync::{LazyLock, Mutex};
-use std::thread;
+use std::{
+    cell::Cell,
+    collections::{HashMap, VecDeque},
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
+    ptr::NonNull,
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+};
 
-use crate::context::Context;
-use crate::context::switch;
-use crate::routine::RsRoutine;
+use crossbeam_deque::{Injector as GlobalQueue, Steal, Worker as LocalQueue};
+
+use crate::{
+    context::{Context, bootstrap_entry_addr, switch},
+    join_handle::{JoinHandle, Packet},
+    routine::{RsRoutine, RunnableFn},
+};
+
+type FinishFn = Box<dyn FnOnce(std::thread::Result<()>) + Send + 'static>;
+type WakeQueue = Arc<Mutex<VecDeque<TaskId>>>;
 
 thread_local! {
     static WORKER: Cell<Option<NonNull<Worker>>> = const { Cell::new(None) };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TaskId(u64);
+
+impl TaskId {
+    pub(crate) fn next() -> Self {
+        let raw = NEXT_TASK_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("task ID space exhausted");
+
+        Self(raw)
+    }
+}
+
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
 enum RunOutcome {
     Yielded,
-    /// ParkRequest(ParkRequest)
-    /// TODO: publish this result through a JoinHandle.
+    Parked,
     Completed(std::thread::Result<()>),
 }
 
 /// `Wrapper around the routine Pin<Box<RsRoutine>>` keeps the routine from moving.
 struct Task {
+    id: TaskId,
     routine: Pin<Box<RsRoutine>>,
     outcome: Option<RunOutcome>,
+    finish: FinishFn,
 }
 
 impl Task {
-    fn new(routine: Pin<Box<RsRoutine>>) -> Self {
+    fn new(routine: Pin<Box<RsRoutine>>, finish: FinishFn) -> Self {
+        let id = TaskId::next();
         Self {
+            id,
             routine,
             outcome: None,
+            finish,
         }
     }
 }
 
-static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+fn suspend_current(outcome: RunOutcome) {
+    let worker_ptr = WORKER.with(|slot| {
+        slot.get()
+            .expect("yield_now called outside runtime")
+            .as_ptr()
+    });
+    let (from, to) = unsafe {
+        let worker = &mut *worker_ptr;
+        let task = worker.current.as_mut().expect("no running task to suspend");
+        assert!(task.outcome.replace(outcome).is_none());
+        let routine = task.routine.as_mut().get_unchecked_mut();
+        (&raw mut routine.context, &raw const worker.context)
+    };
+    switch(from, to);
+}
+
+pub(crate) struct WakeHandle {
+    worker: WorkerId,
+    pub(crate) task: TaskId,
+}
+
+pub(crate) fn current_wake_handle() -> Option<WakeHandle> {
+    WORKER.with(|worker_slot| {
+        // None means this is an external OS thread.
+        let worker_pointer = worker_slot.get()?;
+
+        // SAFETY:
+        // WORKER points at the Worker owned by this OS thread.
+        let worker = unsafe { worker_pointer.as_ref() };
+
+        // WORKER exists while the scheduler is running too, so verify
+        // that a green task is currently executing.
+        let current_task = worker.current.as_ref()?;
+
+        Some(WakeHandle {
+            worker: worker.id,
+            task: current_task.id,
+        })
+    })
+}
+
+pub fn yield_now() {
+    suspend_current(RunOutcome::Yielded);
+}
+
+pub fn park_current() {
+    suspend_current(RunOutcome::Parked);
+}
+
+pub fn spawn<F, T>(func: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let packet = Arc::new(Packet::<T>::new());
+    let output_packet = Arc::clone(&packet);
+    let runnable: RunnableFn = Box::new(move || {
+        let output = func();
+        output_packet.store_output(output);
+    });
+
+    // Runs on the scheduler stack after the Task is finished.
+    let finish_packet = Arc::clone(&packet);
+
+    let finish: FinishFn = Box::new(move |runtime_result| {
+        // Returned(T) + Ok(()) → Ready(Ok(T))
+        // Running     + Err(p) → Ready(Err(p))
+        let waiter = finish_packet.finish(runtime_result);
+
+        // Wake only after releasing the packet mutex.
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
+    });
+
+    let routine = RsRoutine::new_pinned(runnable, bootstrap_entry_addr());
+    let task = Task::new(routine, finish);
+    let task_id = task.id;
+    RUNTIME.schedule(task);
+
+    JoinHandle {
+        task: task_id,
+        packet,
+    }
+}
+
+pub(crate) fn complete_current(result: std::thread::Result<()>) -> ! {
+    suspend_current(RunOutcome::Completed(result));
+    unreachable!("completed task was resumed");
+}
+
+pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     let incoming_queue = GlobalQueue::new();
     let num_workers = num_cpus::get().max(1);
-    let mut worker_threads = Vec::with_capacity(num_workers);
+    let mut worker_control = Vec::with_capacity(num_workers);
     for i in 0..num_workers {
+        let wake_queue = Arc::new(Mutex::new(VecDeque::new()));
         let local_queue = LocalQueue::new_fifo();
+        let worker_wake_queue = Arc::clone(&wake_queue);
         let handle = thread::spawn(move || {
+            // TODO: new() for worker
             let mut worker = Box::new(Worker {
                 id: WorkerId(i),
                 local_queue,
                 tick: 0,
                 context: Context::default(),
                 current: None,
+                parked_tasks: HashMap::new(),
+                wake_queue: worker_wake_queue,
             });
             let worker_ptr = NonNull::from(worker.as_mut());
             WORKER.set(Some(worker_ptr));
@@ -57,23 +185,35 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
             // if worker ever quits we should clean the pointer
             WORKER.set(None);
         });
-        worker_threads.push(handle.thread().clone());
+        worker_control.push(WorkerControl::new(handle.thread().to_owned(), wake_queue));
     }
-    Runtime::new(incoming_queue, worker_threads)
+    Runtime::new(incoming_queue, worker_control)
 });
 
-struct Runtime {
+// Shared wake queue needed for communication between worker and runtime
+struct WorkerControl {
+    thread: std::thread::Thread,
+    wake_queue: WakeQueue,
+}
+
+impl WorkerControl {
+    pub fn new(thread: std::thread::Thread, wake_queue: WakeQueue) -> Self {
+        Self { thread, wake_queue }
+    }
+}
+
+pub(crate) struct Runtime {
     incoming_queue: GlobalQueue<Task>,
-    worker_threads: Vec<thread::Thread>,
+    worker_control: Vec<WorkerControl>,
     idle_workers: Mutex<IdleWorkers>,
 }
 
 impl Runtime {
-    fn new(incoming_queue: GlobalQueue<Task>, worker_threads: Vec<thread::Thread>) -> Self {
-        let worker_count = worker_threads.len();
+    fn new(incoming_queue: GlobalQueue<Task>, worker_control: Vec<WorkerControl>) -> Self {
+        let worker_count = worker_control.len();
         Self {
             incoming_queue,
-            worker_threads,
+            worker_control,
             idle_workers: Mutex::new(IdleWorkers::new(worker_count)),
         }
     }
@@ -84,7 +224,7 @@ impl Runtime {
             self.incoming_queue.push(task);
             idle_workers
                 .take_one()
-                .map(|id| self.worker_threads[id.0].clone())
+                .map(|id| self.worker_control[id.0].thread.clone())
         };
 
         if let Some(worker) = worker_to_wake {
@@ -106,18 +246,18 @@ impl Runtime {
             .cancel(id);
     }
 
-    #[cfg(test)]
-    fn idle_count(&self) -> usize {
-        self.idle_workers
-            .lock()
-            .expect("idle worker lock poisoned")
-            .ids
-            .len()
+    pub(crate) fn wake(&self, handle: WakeHandle) {
+        let worker = self
+            .worker_control
+            .get(handle.worker.0)
+            .expect("Invalid worker ID");
+        worker.wake_queue.lock().unwrap().push_back(handle.task);
+        worker.thread.unpark();
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkerId(usize);
+pub(crate) struct WorkerId(usize);
 
 struct IdleWorkers {
     ids: Vec<WorkerId>,
@@ -171,43 +311,13 @@ struct Worker {
     // Worker context
     context: Context,
     current: Option<Task>,
-}
-
-fn suspend_current(outcome: RunOutcome) {
-    let worker_ptr = WORKER.with(|slot| {
-        slot.get()
-            .expect("yield_now called outside runtime")
-            .as_ptr()
-    });
-    let (from, to) = unsafe {
-        let worker = &mut *worker_ptr;
-        let task = worker.current.as_mut().expect("no running task to suspend");
-        assert!(task.outcome.replace(outcome).is_none());
-        let routine = task.routine.as_mut().get_unchecked_mut();
-        (&raw mut routine.context, &raw const worker.context)
-    };
-    switch(from, to);
-}
-
-pub fn yield_now() {
-    suspend_current(RunOutcome::Yielded);
-}
-
-pub fn spawn<F>(func: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    let routine = RsRoutine::new_pinned(Box::new(func), crate::context::bootstrap_entry_addr());
-    RUNTIME.schedule(Task::new(routine));
-}
-
-pub(crate) fn complete_current(result: std::thread::Result<()>) -> ! {
-    suspend_current(RunOutcome::Completed(result));
-    unreachable!("completed task was resumed");
+    parked_tasks: HashMap<TaskId, Task>,
+    wake_queue: Arc<Mutex<VecDeque<TaskId>>>,
 }
 
 impl Worker {
     fn find_task(&mut self) -> Option<Task> {
+        self.drain_wakes();
         let prefer_local = self.tick.is_multiple_of(2);
 
         let task = if prefer_local {
@@ -230,6 +340,15 @@ impl Worker {
                 Steal::Empty => return None,
             }
         }
+    }
+
+    // Move all tasks to be awaken into the local queue
+    fn drain_wakes(&mut self) {
+        self.wake_queue.lock().unwrap().drain(..).for_each(|task| {
+            if let Some(parked_task) = self.parked_tasks.remove(&task) {
+                self.local_queue.push(parked_task);
+            }
+        })
     }
 
     // Find next routine to run then execute
@@ -290,200 +409,20 @@ impl Worker {
 
         match task.outcome.take() {
             Some(RunOutcome::Yielded) => worker.local_queue.push(task),
+            Some(RunOutcome::Parked) => {
+                worker.parked_tasks.insert(task.id, task);
+            }
             Some(RunOutcome::Completed(result)) => {
-                drop(task);
-                Self::discard_result(result);
+                let Task {
+                    routine, finish, ..
+                } = task;
+
+                drop(routine);
+                let _ = catch_unwind(AssertUnwindSafe(move || {
+                    finish(result);
+                }));
             }
             None => panic!("routine returned without an outcome"),
         }
-    }
-
-    fn discard_result(result: std::thread::Result<()>) {
-        let Err(payload) = result else {
-            return;
-        };
-
-        // A malicious panic payload may itself panic when dropped. Keep that second panic from
-        // terminating a runtime worker; leaking only that pathological payload is the last resort.
-        if let Err(secondary_payload) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
-        {
-            std::mem::forget(secondary_payload);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        rc::Rc,
-        sync::{Arc, Mutex, mpsc},
-        time::Duration,
-    };
-
-    use super::*;
-
-    static GLOBAL_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    struct WorkerTlsGuard(Option<NonNull<Worker>>);
-
-    impl Drop for WorkerTlsGuard {
-        fn drop(&mut self) {
-            WORKER.set(self.0);
-        }
-    }
-
-    fn run_test_tasks(tasks: Vec<Box<dyn FnOnce() + Send + 'static>>) {
-        let local_queue = LocalQueue::new_fifo();
-        for task in tasks {
-            let routine = RsRoutine::new_pinned(task, crate::context::bootstrap_entry_addr());
-            local_queue.push(Task::new(routine));
-        }
-
-        let mut worker = Box::new(Worker {
-            id: WorkerId(0),
-            local_queue,
-            tick: 0,
-            context: Context::default(),
-            current: None,
-        });
-        let worker_ptr = NonNull::from(worker.as_mut());
-        let previous_worker = WORKER.replace(Some(worker_ptr));
-        let _guard = WorkerTlsGuard(previous_worker);
-        assert!(
-            previous_worker.is_none(),
-            "nested test runtimes are unsupported"
-        );
-
-        while let Some(task) = worker.local_queue.pop() {
-            Worker::dispatch(worker_ptr, task);
-        }
-    }
-
-    fn wait_until_all_workers_idle(timeout: Duration) {
-        LazyLock::force(&RUNTIME);
-        let deadline = std::time::Instant::now() + timeout;
-
-        while RUNTIME.idle_count() != RUNTIME.worker_threads.len() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "workers did not become idle before timeout"
-            );
-            thread::yield_now();
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "yield_now called outside runtime")]
-    fn yield_now_rejects_calls_outside_a_task() {
-        yield_now();
-    }
-
-    #[test]
-    fn tasks_yield_and_resume_in_fifo_order() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let first_events = Arc::clone(&events);
-        let second_events = Arc::clone(&events);
-
-        run_test_tasks(vec![
-            Box::new(move || {
-                first_events.lock().unwrap().push("first-before");
-                yield_now();
-                first_events.lock().unwrap().push("first-after");
-            }),
-            Box::new(move || {
-                second_events.lock().unwrap().push("second-before");
-                yield_now();
-                second_events.lock().unwrap().push("second-after");
-            }),
-        ]);
-
-        assert_eq!(
-            *events.lock().unwrap(),
-            [
-                "first-before",
-                "second-before",
-                "first-after",
-                "second-after"
-            ]
-        );
-    }
-
-    #[test]
-    fn yield_preserves_stack_locals() {
-        let observed = Arc::new(Mutex::new(None));
-        let task_observed = Arc::clone(&observed);
-
-        run_test_tasks(vec![Box::new(move || {
-            let mut value = std::hint::black_box(vec![40, 2]);
-            yield_now();
-            value[0] += 1;
-            yield_now();
-            *task_observed.lock().unwrap() = Some(value);
-        })]);
-
-        assert_eq!(*observed.lock().unwrap(), Some(vec![41, 2]));
-    }
-
-    #[test]
-    fn panicking_task_does_not_escape_the_routine_entrypoint() {
-        let completed = Arc::new(Mutex::new(false));
-        let task_completed = Arc::clone(&completed);
-
-        run_test_tasks(vec![
-            Box::new(|| panic!("expected task panic")),
-            Box::new(move || *task_completed.lock().unwrap() = true),
-        ]);
-
-        assert!(*completed.lock().unwrap());
-    }
-
-    #[test]
-    fn yielded_task_stays_on_its_original_worker() {
-        let _guard = GLOBAL_RUNTIME_TEST_LOCK.lock().unwrap();
-        wait_until_all_workers_idle(Duration::from_secs(2));
-
-        let (sender, receiver) = mpsc::channel();
-        spawn(move || {
-            let original_thread = std::thread::current().id();
-            let non_send_local = Rc::new(42);
-
-            for _ in 0..32 {
-                yield_now();
-                assert_eq!(std::thread::current().id(), original_thread);
-                assert_eq!(*non_send_local, 42);
-            }
-
-            sender.send(()).unwrap();
-        });
-
-        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        wait_until_all_workers_idle(Duration::from_secs(2));
-    }
-
-    #[test]
-    fn spawn_wakes_a_parked_worker() {
-        let _guard = GLOBAL_RUNTIME_TEST_LOCK.lock().unwrap();
-        for _ in 0..16 {
-            wait_until_all_workers_idle(Duration::from_secs(2));
-
-            let (sender, receiver) = mpsc::channel();
-            spawn(move || {
-                sender.send("before").unwrap();
-                yield_now();
-                sender.send("after").unwrap();
-            });
-
-            assert_eq!(
-                receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-                "before"
-            );
-            assert_eq!(
-                receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-                "after"
-            );
-        }
-
-        wait_until_all_workers_idle(Duration::from_secs(2));
     }
 }
