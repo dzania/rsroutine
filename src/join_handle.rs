@@ -21,7 +21,6 @@ impl Waiter {
 
 enum JoinState<T> {
     Running { waiter: Option<Waiter> },
-    Returned { output: T, waiter: Option<Waiter> },
     Ready(std::thread::Result<T>),
     Taken,
 }
@@ -42,25 +41,11 @@ impl<T> Packet<T> {
         }
     }
 
-    pub fn store_output(&self, output: T) {
-        let mut state = self.state.lock().unwrap();
-
-        match &mut *state {
-            JoinState::Running { waiter } => {
-                let waiter = waiter.take();
-
-                *state = JoinState::Returned { output, waiter };
-            }
-
-            _ => panic!("output stored in invalid state"),
-        }
-    }
-
     fn register_waiter(&self, new_waiter: Waiter) -> RegisterOutcome<T> {
         let mut state = self.state.lock().unwrap();
 
         match &mut *state {
-            JoinState::Running { waiter } | JoinState::Returned { waiter, .. } => {
+            JoinState::Running { waiter } => {
                 assert!(
                     waiter.replace(new_waiter).is_none(),
                     "join waiter registered twice"
@@ -85,29 +70,17 @@ impl<T> Packet<T> {
         }
     }
 
-    pub(crate) fn finish(&self, runtime_result: std::thread::Result<()>) -> Option<Waiter> {
+    pub(crate) fn complete(&self, runtime_result: std::thread::Result<T>) -> Option<Waiter> {
         let mut state = self.state.lock().unwrap();
 
         // Needed because we cannot move T out through a MutexGuard
         let previous = std::mem::replace(&mut *state, JoinState::Taken);
 
         let (result, waiter) = match (previous, runtime_result) {
-            (JoinState::Returned { output, waiter }, Ok(())) => (Ok(output), waiter),
-
-            (JoinState::Running { waiter }, Err(payload)) => (Err(payload), waiter),
-
-            (JoinState::Running { .. }, Ok(())) => {
-                panic!("task completed without storing output")
-            }
-
-            (JoinState::Returned { .. }, Err(_)) => {
-                panic!("task panicked after storing output")
-            }
-
+            (JoinState::Running { waiter }, result) => (result, waiter),
             (JoinState::Ready(_), _) => {
                 panic!("task finished twice")
             }
-
             (JoinState::Taken, _) => {
                 panic!("task finished after result was taken")
             }
@@ -122,7 +95,7 @@ impl<T> Packet<T> {
         let mut state = self.state.lock().unwrap();
 
         match &*state {
-            JoinState::Running { .. } | JoinState::Returned { .. } => {
+            JoinState::Running { .. } => {
                 return None;
             }
 

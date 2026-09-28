@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
+    thread::available_parallelism,
 };
 
 use crossbeam_deque::{Injector as GlobalQueue, Steal, Worker as LocalQueue};
@@ -19,7 +20,6 @@ use crate::{
     routine::{RsRoutine, RunnableFn},
 };
 
-type FinishFn = Box<dyn FnOnce(std::thread::Result<()>) + Send + 'static>;
 type WakeQueue = Arc<Mutex<VecDeque<TaskId>>>;
 
 thread_local! {
@@ -46,7 +46,7 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 enum RunOutcome {
     Yielded,
     Parked,
-    Completed(std::thread::Result<()>),
+    Completed,
 }
 
 /// `Wrapper around the routine Pin<Box<RsRoutine>>` keeps the routine from moving.
@@ -54,17 +54,15 @@ struct Task {
     id: TaskId,
     routine: Pin<Box<RsRoutine>>,
     outcome: Option<RunOutcome>,
-    finish: FinishFn,
 }
 
 impl Task {
-    fn new(routine: Pin<Box<RsRoutine>>, finish: FinishFn) -> Self {
+    fn new(routine: Pin<Box<RsRoutine>>) -> Self {
         let id = TaskId::next();
         Self {
             id,
             routine,
             outcome: None,
-            finish,
         }
     }
 }
@@ -95,8 +93,7 @@ pub(crate) fn current_wake_handle() -> Option<WakeHandle> {
         // None means this is an external OS thread.
         let worker_pointer = worker_slot.get()?;
 
-        // SAFETY:
-        // WORKER points at the Worker owned by this OS thread.
+        // SAFETY: WORKER points at the Worker owned by this OS thread.
         let worker = unsafe { worker_pointer.as_ref() };
 
         // WORKER exists while the scheduler is running too, so verify
@@ -126,26 +123,14 @@ where
     let packet = Arc::new(Packet::<T>::new());
     let output_packet = Arc::clone(&packet);
     let runnable: RunnableFn = Box::new(move || {
-        let output = func();
-        output_packet.store_output(output);
-    });
-
-    // Runs on the scheduler stack after the Task is finished.
-    let finish_packet = Arc::clone(&packet);
-
-    let finish: FinishFn = Box::new(move |runtime_result| {
-        // Returned(T) + Ok(()) → Ready(Ok(T))
-        // Running     + Err(p) → Ready(Err(p))
-        let waiter = finish_packet.finish(runtime_result);
-
-        // Wake only after releasing the packet mutex.
+        let result = catch_unwind(AssertUnwindSafe(func));
+        let waiter = output_packet.complete(result);
         if let Some(waiter) = waiter {
             waiter.wake();
         }
     });
-
     let routine = RsRoutine::new_pinned(runnable, bootstrap_entry_addr());
-    let task = Task::new(routine, finish);
+    let task = Task::new(routine);
     let task_id = task.id;
     RUNTIME.schedule(task);
 
@@ -155,30 +140,22 @@ where
     }
 }
 
-pub(crate) fn complete_current(result: std::thread::Result<()>) -> ! {
-    suspend_current(RunOutcome::Completed(result));
+pub(crate) fn complete_current() -> ! {
+    suspend_current(RunOutcome::Completed);
     unreachable!("completed task was resumed");
 }
 
 pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     let incoming_queue = GlobalQueue::new();
-    let num_workers = num_cpus::get().max(1);
+    let num_workers = available_parallelism()
+        .expect("Failed to retrieve available parallelism")
+        .into();
     let mut worker_control = Vec::with_capacity(num_workers);
     for i in 0..num_workers {
         let wake_queue = Arc::new(Mutex::new(VecDeque::new()));
-        let local_queue = LocalQueue::new_fifo();
         let worker_wake_queue = Arc::clone(&wake_queue);
         let handle = thread::spawn(move || {
-            // TODO: new() for worker
-            let mut worker = Box::new(Worker {
-                id: WorkerId(i),
-                local_queue,
-                tick: 0,
-                context: Context::default(),
-                current: None,
-                parked_tasks: HashMap::new(),
-                wake_queue: worker_wake_queue,
-            });
+            let mut worker = Box::new(Worker::new(WorkerId(i), worker_wake_queue));
             let worker_ptr = NonNull::from(worker.as_mut());
             WORKER.set(Some(worker_ptr));
             Worker::poll(worker_ptr);
@@ -316,6 +293,18 @@ struct Worker {
 }
 
 impl Worker {
+    fn new(id: WorkerId, wake_queue: WakeQueue) -> Self {
+        Self {
+            id,
+            local_queue: LocalQueue::new_fifo(),
+            tick: 0,
+            context: Context::default(),
+            current: None,
+            parked_tasks: HashMap::new(),
+            wake_queue,
+        }
+    }
+
     fn find_task(&mut self) -> Option<Task> {
         self.drain_wakes();
         let prefer_local = self.tick.is_multiple_of(2);
@@ -344,11 +333,12 @@ impl Worker {
 
     // Move all tasks to be awaken into the local queue
     fn drain_wakes(&mut self) {
-        self.wake_queue.lock().unwrap().drain(..).for_each(|task| {
+        let woken = std::mem::take(&mut *self.wake_queue.lock().expect("wake queue lock poisoned"));
+        for task in woken {
             if let Some(parked_task) = self.parked_tasks.remove(&task) {
                 self.local_queue.push(parked_task);
             }
-        })
+        }
     }
 
     // Find next routine to run then execute
@@ -389,12 +379,8 @@ impl Worker {
         let worker_ptr = worker.as_ptr();
         let (from, to) = {
             let worker = unsafe { &mut *worker_ptr };
-
-            worker.current = Some(task);
-
-            let task = worker.current.as_ref().expect("current task must exist");
+            let task = worker.current.insert(task);
             assert!(task.outcome.is_none());
-
             let routine = task.routine.as_ref().get_ref();
             (&raw mut worker.context, &raw const routine.context)
         };
@@ -412,16 +398,7 @@ impl Worker {
             Some(RunOutcome::Parked) => {
                 worker.parked_tasks.insert(task.id, task);
             }
-            Some(RunOutcome::Completed(result)) => {
-                let Task {
-                    routine, finish, ..
-                } = task;
-
-                drop(routine);
-                let _ = catch_unwind(AssertUnwindSafe(move || {
-                    finish(result);
-                }));
-            }
+            Some(RunOutcome::Completed) => drop(task),
             None => panic!("routine returned without an outcome"),
         }
     }

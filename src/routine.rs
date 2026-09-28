@@ -1,8 +1,4 @@
-use std::{
-    marker::PhantomPinned,
-    panic::{AssertUnwindSafe, catch_unwind},
-    pin::Pin,
-};
+use std::{marker::PhantomPinned, pin::Pin};
 
 use crate::{context::Context, stack::Stack};
 
@@ -58,9 +54,9 @@ extern "C" fn routine_entry(routine: *mut RsRoutine) -> ! {
             .take()
             .expect("routine function must exist on first entry")
     };
-    let result = catch_unwind(AssertUnwindSafe(func));
+    func();
 
-    crate::runtime::complete_current(result)
+    crate::runtime::complete_current()
 }
 
 #[cfg(test)]
