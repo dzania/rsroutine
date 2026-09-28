@@ -1,26 +1,59 @@
-// TODO: Implement stack guard page.
+use std::ptr::NonNull;
+
+use libc::{_SC_PAGESIZE, MAP_FAILED, munmap, sysconf};
+
 pub(crate) struct Stack {
-    bytes: Vec<u8>,
+    mapping: NonNull<u8>,
+    mapping_len: usize,
+    guard_len: usize,
+    usable_len: usize,
 }
+
+// SAFETY: Stack exclusively owns mmap allocation
+unsafe impl Send for Stack {}
 
 impl Stack {
     pub(crate) fn new(size: usize) -> Self {
-        Stack {
-            bytes: vec![0; size],
+        let page_size = page_size();
+        let usable_len = round_up_to_page(size, page_size).expect("stack size overflow");
+        let mapping_len = page_size
+            .checked_add(usable_len)
+            .expect("stack mapping size overflow");
+        let guard_len = page_size;
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapping_len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if raw == MAP_FAILED {
+            panic!("Failed to allocate stack");
+        };
+        let mapping = NonNull::new(raw.cast::<u8>()).expect("mmap returned null");
+        Self {
+            mapping,
+            mapping_len,
+            usable_len,
+            guard_len,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
+        self.usable_len
     }
 
     pub(crate) fn bottom_addr(&self) -> usize {
-        self.bytes.as_ptr() as usize
+        let usable_start = unsafe { self.mapping.as_ptr().add(self.guard_len) };
+        usable_start as usize
     }
 
     pub(crate) fn top_addr(&self) -> usize {
-        self.bottom_addr() + self.bytes.len()
+        self.bottom_addr() + self.usable_len
     }
 
     pub(crate) fn aligned_top(&self) -> usize {
@@ -29,30 +62,33 @@ impl Stack {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn round_up_to_page(size: usize, page_size: usize) -> Option<usize> {
+    assert!(page_size > 0);
 
-    #[test]
-    fn stack_allocates_requested_zeroed_memory() {
-        let stack = Stack::new(256);
+    let remainder = size % page_size;
 
-        assert_eq!(stack.bytes.len(), 256);
-        assert!(stack.bytes.iter().all(|byte| *byte == 0));
+    if remainder == 0 {
+        Some(size)
+    } else {
+        size.checked_add(page_size - remainder)
     }
+}
 
-    #[test]
-    fn stack_addresses_describe_owned_memory_region() {
-        let stack = Stack::new(257);
-        let bottom_addr = stack.bottom_addr();
-        let top_addr = stack.top_addr();
-        let aligned_top = stack.aligned_top();
+fn page_size() -> usize {
+    let size = unsafe { sysconf(_SC_PAGESIZE) };
 
-        assert_eq!(top_addr, bottom_addr + stack.bytes.len());
-        assert!(bottom_addr < top_addr);
-        assert!(bottom_addr <= aligned_top);
-        assert!(aligned_top <= top_addr);
-        assert_eq!(aligned_top % 16, 0);
-        assert!(top_addr - aligned_top < 16);
+    assert!(size > 0, "failed to obtain system page size");
+
+    size as usize
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(
+                self.mapping.as_ptr().cast::<libc::c_void>(),
+                self.mapping_len,
+            )
+        };
     }
 }

@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 crossbeam-deque = "0.8.6"
+libc = "0.2.189"
 num_cpus = "1.17.0"
