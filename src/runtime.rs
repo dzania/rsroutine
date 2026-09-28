@@ -31,12 +31,7 @@ pub(crate) struct TaskId(u64);
 
 impl TaskId {
     pub(crate) fn next() -> Self {
-        let raw = NEXT_TASK_ID
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("task ID space exhausted");
-
+        let raw = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
         Self(raw)
     }
 }
