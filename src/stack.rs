@@ -1,6 +1,6 @@
 use std::ptr::NonNull;
 
-use libc::{_SC_PAGESIZE, MAP_FAILED, munmap, sysconf};
+use libc::{_SC_PAGESIZE, MAP_FAILED};
 
 pub(crate) struct Stack {
     mapping: NonNull<u8>,
@@ -16,10 +16,10 @@ impl Stack {
     pub(crate) fn new(size: usize) -> Self {
         let page_size = page_size();
         let usable_len = round_up_to_page(size, page_size).expect("stack size overflow");
-        let mapping_len = page_size
+        let guard_len = page_size;
+        let mapping_len = guard_len
             .checked_add(usable_len)
             .expect("stack mapping size overflow");
-        let guard_len = page_size;
         let raw = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -33,13 +33,27 @@ impl Stack {
         if raw == MAP_FAILED {
             panic!("Failed to allocate stack");
         };
+
         let mapping = NonNull::new(raw.cast::<u8>()).expect("mmap returned null");
-        Self {
+        let stack = Self {
             mapping,
             mapping_len,
             usable_len,
             guard_len,
-        }
+        };
+
+        let result = unsafe {
+            libc::mprotect(
+                stack.bottom_addr() as *mut libc::c_void,
+                stack.usable_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        };
+        // Panicking drops `stack`, whose Drop impl unmaps the region.
+        if result != 0 {
+            panic!("Failed to allocate protected page.")
+        };
+        stack
     }
 
     #[cfg(test)]
@@ -47,13 +61,12 @@ impl Stack {
         self.usable_len
     }
 
-    pub(crate) fn bottom_addr(&self) -> usize {
-        let usable_start = unsafe { self.mapping.as_ptr().add(self.guard_len) };
-        usable_start as usize
+    pub(crate) fn bottom_addr(&self) -> *mut u8 {
+        unsafe { self.mapping.as_ptr().add(self.guard_len) }
     }
 
     pub(crate) fn top_addr(&self) -> usize {
-        self.bottom_addr() + self.usable_len
+        self.bottom_addr() as usize + self.usable_len
     }
 
     pub(crate) fn aligned_top(&self) -> usize {
@@ -75,7 +88,7 @@ fn round_up_to_page(size: usize, page_size: usize) -> Option<usize> {
 }
 
 fn page_size() -> usize {
-    let size = unsafe { sysconf(_SC_PAGESIZE) };
+    let size = unsafe { libc::sysconf(_SC_PAGESIZE) };
 
     assert!(size > 0, "failed to obtain system page size");
 
@@ -85,7 +98,7 @@ fn page_size() -> usize {
 impl Drop for Stack {
     fn drop(&mut self) {
         unsafe {
-            munmap(
+            libc::munmap(
                 self.mapping.as_ptr().cast::<libc::c_void>(),
                 self.mapping_len,
             )
