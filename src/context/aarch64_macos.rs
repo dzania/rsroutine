@@ -49,6 +49,9 @@ impl Context {
     }
 }
 
+// SAFETY: These declarations match the symbols defined in `aarch_macos.S`. `swap_context` reads
+// and writes exactly `size_of::<Context>()` bytes through its pointers, using the field offsets of
+// the `#[repr(C)]` layout above.
 unsafe extern "C" {
     fn swap_context(from: *mut Context, to: *const Context);
     fn bootstrap_entry() -> !;
@@ -58,9 +61,20 @@ pub(crate) fn bootstrap_entry_addr() -> usize {
     bootstrap_entry as *const () as usize
 }
 
-pub(crate) fn switch(from: *mut Context, to: *const Context) {
-    // SAFETY: The caller guarantees that both references point to valid Context values, that
-    // `to.sp` points to a valid stack, and that `to.x30` points to executable code.
+/// Saves the current registers into `from` and resumes execution from `to`.
+///
+/// Returns only when some later `switch` resumes `from`.
+///
+/// # Safety
+///
+/// - `from` must be valid for writes and stay valid until something resumes it.
+/// - `to` must point to a `Context` that was either built by `Context::new_routine` for a stack
+///   that is still mapped, or saved by an earlier `switch` whose stack is still mapped.
+/// - No `&mut` reference that code on the other side of the switch also uses may be live across
+///   the call, because that code will create its own references to the same data.
+pub(crate) unsafe fn switch(from: *mut Context, to: *const Context) {
+    // SAFETY: The caller upholds the contract documented above, which is exactly what
+    // `swap_context` needs.
     unsafe {
         swap_context(from, to);
     }

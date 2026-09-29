@@ -68,6 +68,11 @@ fn suspend_current(outcome: RunOutcome) {
             .expect("yield_now called outside runtime")
             .as_ptr()
     });
+    // SAFETY: WORKER was set by this OS thread to its own boxed Worker, which is never freed while
+    // `poll` runs. This code runs on a task stack, so the scheduler is suspended inside the
+    // `switch` in `dispatch` and holds no reference to the worker; this `&mut` is the only live
+    // one, and it ends with this block. `get_unchecked_mut` is used only to take the address of
+    // `routine.context`; the routine is not moved.
     let (from, to) = unsafe {
         let worker = &mut *worker_ptr;
         let task = worker.current.as_mut().expect("no running task to suspend");
@@ -75,7 +80,11 @@ fn suspend_current(outcome: RunOutcome) {
         let routine = task.routine.as_mut().get_unchecked_mut();
         (&raw mut routine.context, &raw const worker.context)
     };
-    switch(from, to);
+    // SAFETY: `from` is the running task's context inside its pinned, boxed routine, which stays
+    // in place until the scheduler resumes or drops the task. `to` is the worker context saved by
+    // the `switch` in `dispatch` that started this task, so it points at the live worker stack.
+    // No references into the worker are live across the switch.
+    unsafe { switch(from, to) };
 }
 
 pub(crate) struct WakeHandle {
@@ -88,7 +97,9 @@ pub(crate) fn current_wake_handle() -> Option<WakeHandle> {
         // None means this is an external OS thread.
         let worker_pointer = worker_slot.get()?;
 
-        // SAFETY: WORKER points at the Worker owned by this OS thread.
+        // SAFETY: WORKER points at the boxed Worker owned by this OS thread, which outlives `poll`.
+        // This is called from task code, while the scheduler is suspended inside `switch` and
+        // holds no `&mut` to the worker, so a short-lived shared reference cannot alias one.
         let worker = unsafe { worker_pointer.as_ref() };
 
         // WORKER exists while the scheduler is running too, so verify
@@ -153,9 +164,9 @@ pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
             let mut worker = Box::new(Worker::new(WorkerId(i), worker_wake_queue));
             let worker_ptr = NonNull::from(worker.as_mut());
             WORKER.set(Some(worker_ptr));
-            Worker::poll(worker_ptr);
-            // if worker ever quits we should clean the pointer
-            WORKER.set(None);
+            // SAFETY: `worker_ptr` points at `worker`, which this thread owns and never touches
+            // again, and `poll` never returns.
+            unsafe { Worker::poll(worker_ptr) }
         });
         worker_control.push(WorkerControl::new(handle.thread().to_owned(), wake_queue));
     }
@@ -336,43 +347,49 @@ impl Worker {
         }
     }
 
-    // Find next routine to run then execute
-    fn poll(worker: NonNull<Self>) {
-        let worker_ptr = worker.as_ptr();
-        let worker_id = unsafe { (*worker_ptr).id };
-
+    fn wait_for_task(&mut self) -> Task {
         loop {
-            let task = {
-                let worker = unsafe { &mut *worker_ptr };
-                worker.find_task()
-            };
+            if let Some(task) = self.find_task() {
+                return task;
+            }
 
-            let Some(task) = task else {
-                RUNTIME.register_idle(worker_id);
-
-                let task = {
-                    let worker = unsafe { &mut *worker_ptr };
-                    worker.find_task()
-                };
-
-                if let Some(task) = task {
-                    RUNTIME.cancel_idle(worker_id);
-                    Self::dispatch(worker, task);
-                    continue;
-                }
-
+            RUNTIME.register_idle(self.id);
+            let task = self.find_task();
+            if task.is_none() {
                 thread::park();
-                RUNTIME.cancel_idle(worker_id);
-                continue;
-            };
+            }
+            RUNTIME.cancel_idle(self.id);
 
-            Self::dispatch(worker, task);
+            if let Some(task) = task {
+                return task;
+            }
         }
     }
 
-    fn dispatch(worker: NonNull<Self>, task: Task) {
+    /// # Safety
+    ///
+    /// `worker` must point at a live Worker owned by the calling thread and stored in its
+    /// `WORKER`, and nothing else may access it except task code through `WORKER`.
+    unsafe fn poll(worker: NonNull<Self>) -> ! {
+        loop {
+            // SAFETY: No task runs while `wait_for_task` runs, and the reference ends with this
+            // statement, before `dispatch` switches.
+            let task = unsafe { &mut *worker.as_ptr() }.wait_for_task();
+            // SAFETY: Forwarded from this function's contract.
+            unsafe { Self::dispatch(worker, task) };
+        }
+    }
+
+    /// Runs `task` until it yields, parks, or completes, then files it accordingly.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as `poll`, and the caller must not hold a reference to the worker.
+    unsafe fn dispatch(worker: NonNull<Self>, task: Task) {
         let worker_ptr = worker.as_ptr();
         let (from, to) = {
+            // SAFETY: No task is running and the caller holds no reference to the worker, so this
+            // is the only one. It ends with this block, before the switch.
             let worker = unsafe { &mut *worker_ptr };
             let task = worker.current.insert(task);
             assert!(task.outcome.is_none());
@@ -380,8 +397,15 @@ impl Worker {
             (&raw mut worker.context, &raw const routine.context)
         };
 
-        switch(from, to);
+        // SAFETY: `from` is the worker context inside the boxed Worker, which outlives this call.
+        // `to` is the context of the task now stored in `worker.current`; its routine is pinned in
+        // a Box and its stack stays mapped until the task is dropped below. That context was
+        // either built by `Context::new_routine` or saved by the task's own `switch` in
+        // `suspend_current`. No references to the worker are live across the switch.
+        unsafe { switch(from, to) };
 
+        // SAFETY: The task has switched back to us, and the `&mut` that `suspend_current` created
+        // ended before its switch, so this is again the only reference to the worker.
         let worker = unsafe { &mut *worker_ptr };
         let mut task = worker
             .current

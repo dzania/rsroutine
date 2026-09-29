@@ -9,7 +9,9 @@ pub(crate) struct Stack {
     usable_len: usize,
 }
 
-// SAFETY: Stack exclusively owns mmap allocation
+// SAFETY: Stack exclusively owns its mapping, and nothing else holds the pointer. Anonymous mmap
+// memory is not tied to the thread that created it, so moving ownership to another thread is
+// sound. Stack is deliberately not Sync: it offers no shared access to the memory.
 unsafe impl Send for Stack {}
 
 impl Stack {
@@ -20,6 +22,9 @@ impl Stack {
         let mapping_len = guard_len
             .checked_add(usable_len)
             .expect("stack mapping size overflow");
+        // SAFETY: A null address hint with MAP_PRIVATE | MAP_ANON, fd -1, and offset 0 asks the
+        // kernel for fresh memory and cannot affect any existing mapping. The result is checked
+        // against MAP_FAILED below.
         let raw = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -42,6 +47,11 @@ impl Stack {
             guard_len,
         };
 
+        // SAFETY: The range starts `guard_len` bytes into the mapping created above and is
+        // `usable_len` bytes long, so it ends exactly at the end of the mapping
+        // (`guard_len + usable_len == mapping_len`). mmap returns a page-aligned address and
+        // `guard_len` is one page, so the start is page-aligned as mprotect requires. Nothing
+        // else references this memory yet.
         let result = unsafe {
             libc::mprotect(
                 stack.bottom_addr() as *mut libc::c_void,
@@ -62,6 +72,8 @@ impl Stack {
     }
 
     pub(crate) fn bottom_addr(&self) -> *mut u8 {
+        // SAFETY: `guard_len < mapping_len`, so the offset stays inside the mapping that
+        // `mapping` points to, as `add` requires.
         unsafe { self.mapping.as_ptr().add(self.guard_len) }
     }
 
@@ -88,6 +100,7 @@ fn round_up_to_page(size: usize, page_size: usize) -> Option<usize> {
 }
 
 fn page_size() -> usize {
+    // SAFETY: sysconf has no memory-safety preconditions; the result is checked below.
     let size = unsafe { libc::sysconf(_SC_PAGESIZE) };
 
     assert!(size > 0, "failed to obtain system page size");
@@ -97,6 +110,9 @@ fn page_size() -> usize {
 
 impl Drop for Stack {
     fn drop(&mut self) {
+        // SAFETY: `mapping` and `mapping_len` are exactly the address and length mmap returned,
+        // and this Stack owns the mapping exclusively, so nothing else can still be using it. The
+        // runtime drops a task's Stack only from the worker stack, after switching away from it.
         unsafe {
             libc::munmap(
                 self.mapping.as_ptr().cast::<libc::c_void>(),

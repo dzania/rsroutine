@@ -35,9 +35,10 @@ impl RsRoutine {
         routine
     }
 
-    // The routine has already been pinned. The mutable reference is used only to obtain its stable address and update scalar context fields in place.
-    // Neither the routine nor its address-sensitive fields are moved or replaced.
     pub(crate) fn initialize_bootstrap(self: Pin<&mut Self>) {
+        // SAFETY: The mutable reference is used only to take the routine's stable address and to
+        // write two `usize` fields in place. Nothing is moved out of it or replaced, so the
+        // pinning guarantee holds.
         let routine_ref: &mut RsRoutine = unsafe { Pin::get_unchecked_mut(self) };
         let routine_ptr: *mut RsRoutine = routine_ref as *mut RsRoutine;
         routine_ref.context.x19 = routine_ptr as usize;
@@ -46,8 +47,10 @@ impl RsRoutine {
 }
 
 extern "C" fn routine_entry(routine: *mut RsRoutine) -> ! {
-    // SAFETY: `initialize_bootstrap` stores a valid pointer to the boxed routine before the
-    // routine can be started.
+    // SAFETY: `initialize_bootstrap` stores a pointer to the pinned, boxed routine in x19 before
+    // the routine can be started, and the box stays alive until the task is dropped after it
+    // completes. While this task runs, the scheduler holds no reference to the routine (`dispatch`
+    // keeps only a raw pointer to its context), so this access does not alias.
     let func = unsafe {
         (*routine)
             .func
