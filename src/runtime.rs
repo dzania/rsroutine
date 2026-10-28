@@ -16,6 +16,7 @@ use crossbeam_deque::{Injector as GlobalQueue, Steal, Worker as LocalQueue};
 
 use crate::{
     context::{Context, bootstrap_entry_addr, switch},
+    idle::{IdleWorkers, WORKER_COUNT_MAX},
     join_handle::{JoinHandle, Packet},
     routine::{RsRoutine, RunnableFn},
     routine_pool::RoutinePool,
@@ -185,9 +186,9 @@ pub(crate) fn complete_current() -> ! {
 
 pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     let incoming_queue = GlobalQueue::new();
-    let num_workers = available_parallelism()
-        .expect("Failed to retrieve available parallelism")
-        .into();
+    let num_workers =
+        usize::from(available_parallelism().expect("Failed to retrieve available parallelism"))
+            .min(WORKER_COUNT_MAX);
     let mut worker_control = Vec::with_capacity(num_workers);
     for i in 0..num_workers {
         let wake_queue = Arc::new(Mutex::new(VecDeque::new()));
@@ -220,7 +221,7 @@ impl WorkerControl {
 pub(crate) struct Runtime {
     incoming_queue: GlobalQueue<Task>,
     worker_control: Vec<WorkerControl>,
-    idle_workers: Mutex<IdleWorkers>,
+    idle_workers: IdleWorkers,
 }
 
 impl Runtime {
@@ -229,38 +230,30 @@ impl Runtime {
         Self {
             incoming_queue,
             worker_control,
-            idle_workers: Mutex::new(IdleWorkers::new(worker_count)),
+            idle_workers: IdleWorkers::new(worker_count),
         }
     }
 
     fn schedule(&self, task: Task) {
-        let worker_to_wake = {
-            let mut idle_workers = self.idle_workers.lock().expect("idle worker lock poisoned");
-            self.incoming_queue.push(task);
-            idle_workers
-                .take_one()
-                .map(|id| self.worker_control[id.0].thread.clone())
-        };
+        self.incoming_queue.push(task);
+        self.notify_one();
+    }
 
-        if let Some(worker) = worker_to_wake {
-            worker.unpark();
+    // Unparks one parked worker if nobody is searching. Most calls return after one atomic
+    // load, without locking or a system call.
+    fn notify_one(&self) {
+        if let Some(worker_id) = self.idle_workers.worker_to_notify() {
+            self.worker_control[worker_id.0].thread.unpark();
         }
     }
 
-    fn register_idle(&self, id: WorkerId) {
-        self.idle_workers
-            .lock()
-            .expect("idle worker lock poisoned")
-            .register(id);
+    fn has_incoming(&self) -> bool {
+        !self.incoming_queue.is_empty()
     }
 
-    fn cancel_idle(&self, id: WorkerId) {
-        self.idle_workers
-            .lock()
-            .expect("idle worker lock poisoned")
-            .cancel(id);
-    }
-
+    // Unparks the owning worker without touching `idle_workers`. If the worker is parked, it
+    // finds itself still in the sleeper list on waking and fixes the counts in
+    // `finish_parking`. If it is awake, the unpark token makes its next `park` return at once.
     pub(crate) fn wake(&self, handle: WakeHandle) {
         let worker = self
             .worker_control
@@ -272,49 +265,7 @@ impl Runtime {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct WorkerId(usize);
-
-struct IdleWorkers {
-    ids: Vec<WorkerId>,
-    registered: Vec<bool>,
-}
-
-impl IdleWorkers {
-    fn new(worker_count: usize) -> Self {
-        Self {
-            ids: Vec::with_capacity(worker_count),
-            registered: vec![false; worker_count],
-        }
-    }
-
-    fn register(&mut self, id: WorkerId) {
-        assert!(id.0 < self.registered.len(), "invalid worker ID");
-        assert!(!self.registered[id.0], "worker registered as idle twice");
-        self.registered[id.0] = true;
-        self.ids.push(id);
-    }
-
-    fn cancel(&mut self, id: WorkerId) {
-        if !self.registered[id.0] {
-            return;
-        }
-
-        let position = self
-            .ids
-            .iter()
-            .position(|candidate| *candidate == id)
-            .expect("registered idle worker must have an ID entry");
-        self.ids.swap_remove(position);
-        self.registered[id.0] = false;
-    }
-
-    fn take_one(&mut self) -> Option<WorkerId> {
-        let id = self.ids.pop()?;
-        assert!(self.registered[id.0]);
-        self.registered[id.0] = false;
-        Some(id)
-    }
-}
+pub(crate) struct WorkerId(pub(crate) usize);
 
 struct Worker {
     id: WorkerId,
@@ -385,6 +336,9 @@ impl Worker {
     fn poll(worker: NonNull<Self>) {
         let worker_ptr = worker.as_ptr();
         let worker_id = unsafe { (*worker_ptr).id };
+        // Mirrors whether `idle_workers` counts this worker as searching. A worker woken by
+        // `worker_to_notify` starts out searching.
+        let mut is_searching = false;
 
         loop {
             let task = {
@@ -392,27 +346,49 @@ impl Worker {
                 worker.find_task()
             };
 
-            let Some(task) = task else {
-                RUNTIME.register_idle(worker_id);
-
-                let task = {
-                    let worker = unsafe { &mut *worker_ptr };
-                    worker.find_task()
-                };
-
-                if let Some(task) = task {
-                    RUNTIME.cancel_idle(worker_id);
-                    Self::dispatch(worker, task);
-                    continue;
+            // Only a searcher's scan of the injector counts as having looked before parking.
+            let task = match task {
+                Some(task) => Some(task),
+                None => {
+                    is_searching = is_searching || RUNTIME.idle_workers.try_start_searching();
+                    if is_searching {
+                        Self::find_incoming_task()
+                    } else {
+                        None
+                    }
                 }
+            };
 
-                thread::park();
-                RUNTIME.cancel_idle(worker_id);
+            let Some(task) = task else {
+                is_searching = Self::park(worker_id, is_searching);
                 continue;
             };
 
+            if is_searching {
+                is_searching = false;
+                // Spawns that saw this worker searching skipped their wake. If it was the last
+                // searcher, wake another worker so the rest of that work is not left waiting.
+                if RUNTIME.idle_workers.stop_searching() {
+                    RUNTIME.notify_one();
+                }
+            }
+
             Self::dispatch(worker, task);
         }
+    }
+
+    // Parks the thread until a spawner or a task wake unparks it. Returns whether the worker
+    // woke up counted as searching.
+    fn park(worker_id: WorkerId, is_searching: bool) -> bool {
+        let is_last_searcher = RUNTIME.idle_workers.start_parking(worker_id, is_searching);
+        // Spawners that pushed while this worker searched skipped the wake and relied on it
+        // seeing their task, so the last searcher must look once more.
+        if is_last_searcher && RUNTIME.has_incoming() {
+            return RUNTIME.idle_workers.finish_parking(worker_id);
+        }
+
+        thread::park();
+        RUNTIME.idle_workers.finish_parking(worker_id)
     }
 
     fn dispatch(worker: NonNull<Self>, task: Task) {
@@ -476,6 +452,41 @@ mod tests {
 
         let expected: usize = (0..8 * task_count).sum();
         assert_eq!(parent.join().expect("parent task must not panic"), expected);
+    }
+
+    // Each join from this OS thread waits long enough for idle workers to park, so every spawn
+    // has to wake one. A lost wakeup hangs this test.
+    #[test]
+    fn spawn_wakes_parked_workers() {
+        for index in 0..2_000_u32 {
+            let task = spawn(move || index);
+            assert_eq!(task.join().expect("task must not panic"), index);
+        }
+    }
+
+    // Many OS threads spawn at once while workers keep going idle, so notifies, searches, and
+    // parks race with each other.
+    #[test]
+    fn concurrent_spawners_all_complete() {
+        let spawners: Vec<_> = (0..8_u64)
+            .map(|spawner| {
+                std::thread::spawn(move || {
+                    let mut total = 0;
+                    for index in 0..500_u64 {
+                        total += spawn(move || spawner * 500 + index)
+                            .join()
+                            .expect("task must not panic");
+                    }
+                    total
+                })
+            })
+            .collect();
+
+        let total: u64 = spawners
+            .into_iter()
+            .map(|spawner| spawner.join().expect("spawner thread must not panic"))
+            .sum();
+        assert_eq!(total, (0..8 * 500).sum::<u64>());
     }
 
     // A panicking task still completes through `complete_current`, so its routine goes back to
