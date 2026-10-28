@@ -7,6 +7,13 @@ edition = "2024"
 crossbeam-deque = "0.8.6"
 libc = "0.2.189"
 
+# Model-checks the idle-worker protocol in `src/idle.rs`. Only built with `--cfg loom`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
 [[bench]]
 name = "spawn_join"
 harness = false
