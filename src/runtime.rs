@@ -18,6 +18,7 @@ use crate::{
     context::{Context, bootstrap_entry_addr, switch},
     join_handle::{JoinHandle, Packet},
     routine::{RsRoutine, RunnableFn},
+    routine_pool::RoutinePool,
 };
 
 type WakeQueue = Arc<Mutex<VecDeque<TaskId>>>;
@@ -44,20 +45,63 @@ enum RunOutcome {
     Completed,
 }
 
-/// `Wrapper around the routine Pin<Box<RsRoutine>>` keeps the routine from moving.
+enum TaskBody {
+    // Not dispatched yet. The worker attaches a routine from its pool on first dispatch, so
+    // queued tasks hold no stack and stacks are taken and returned on the same thread.
+    Pending(RunnableFn),
+    // `Pin<Box<RsRoutine>>` keeps the routine from moving while it has a live context.
+    Started(Pin<Box<RsRoutine>>),
+}
+
 struct Task {
     id: TaskId,
-    routine: Pin<Box<RsRoutine>>,
+    body: TaskBody,
     outcome: Option<RunOutcome>,
 }
 
 impl Task {
-    fn new(routine: Pin<Box<RsRoutine>>) -> Self {
+    fn new(func: RunnableFn) -> Self {
         let id = TaskId::next();
         Self {
             id,
-            routine,
+            body: TaskBody::Pending(func),
             outcome: None,
+        }
+    }
+
+    fn into_started(self, routine_pool: &mut RoutinePool) -> Self {
+        match self.body {
+            TaskBody::Started(_) => self,
+            TaskBody::Pending(func) => {
+                let mut routine = routine_pool.acquire();
+                routine.as_mut().start(func, bootstrap_entry_addr());
+                Self {
+                    id: self.id,
+                    body: TaskBody::Started(routine),
+                    outcome: self.outcome,
+                }
+            }
+        }
+    }
+
+    fn routine(&self) -> &RsRoutine {
+        match &self.body {
+            TaskBody::Started(routine) => routine.as_ref().get_ref(),
+            TaskBody::Pending(_) => panic!("task has no routine before first dispatch"),
+        }
+    }
+
+    fn routine_mut(&mut self) -> Pin<&mut RsRoutine> {
+        match &mut self.body {
+            TaskBody::Started(routine) => routine.as_mut(),
+            TaskBody::Pending(_) => panic!("task has no routine before first dispatch"),
+        }
+    }
+
+    fn into_routine(self) -> Pin<Box<RsRoutine>> {
+        match self.body {
+            TaskBody::Started(routine) => routine,
+            TaskBody::Pending(_) => panic!("task has no routine before first dispatch"),
         }
     }
 }
@@ -72,7 +116,7 @@ fn suspend_current(outcome: RunOutcome) {
         let worker = &mut *worker_ptr;
         let task = worker.current.as_mut().expect("no running task to suspend");
         assert!(task.outcome.replace(outcome).is_none());
-        let routine = task.routine.as_mut().get_unchecked_mut();
+        let routine = task.routine_mut().get_unchecked_mut();
         (&raw mut routine.context, &raw const worker.context)
     };
     switch(from, to);
@@ -124,8 +168,7 @@ where
             waiter.wake();
         }
     });
-    let routine = RsRoutine::new_pinned(runnable, bootstrap_entry_addr());
-    let task = Task::new(routine);
+    let task = Task::new(runnable);
     let task_id = task.id;
     RUNTIME.schedule(task);
 
@@ -285,6 +328,7 @@ struct Worker {
     current: Option<Task>,
     parked_tasks: HashMap<TaskId, Task>,
     wake_queue: Arc<Mutex<VecDeque<TaskId>>>,
+    routine_pool: RoutinePool,
 }
 
 impl Worker {
@@ -297,6 +341,7 @@ impl Worker {
             current: None,
             parked_tasks: HashMap::new(),
             wake_queue,
+            routine_pool: RoutinePool::new(),
         }
     }
 
@@ -374,9 +419,10 @@ impl Worker {
         let worker_ptr = worker.as_ptr();
         let (from, to) = {
             let worker = unsafe { &mut *worker_ptr };
+            let task = task.into_started(&mut worker.routine_pool);
             let task = worker.current.insert(task);
             assert!(task.outcome.is_none());
-            let routine = task.routine.as_ref().get_ref();
+            let routine = task.routine();
             (&raw mut worker.context, &raw const routine.context)
         };
 
@@ -393,8 +439,55 @@ impl Worker {
             Some(RunOutcome::Parked) => {
                 worker.parked_tasks.insert(task.id, task);
             }
-            Some(RunOutcome::Completed) => drop(task),
+            // The routine stopped inside `complete_current` and is never resumed, so its stack
+            // is free to run the next task on this worker.
+            Some(RunOutcome::Completed) => worker.routine_pool.release(task.into_routine()),
             None => panic!("routine returned without an outcome"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routine_pool::ROUTINE_POOL_CAPACITY;
+
+    // Each batch outlives the pool, so later batches run on reused stacks and on fresh ones.
+    #[test]
+    fn tasks_run_correctly_on_reused_routines() {
+        let task_count = ROUTINE_POOL_CAPACITY * 4;
+        let parent = spawn(move || {
+            let mut total = 0;
+            for batch in 0..8 {
+                let children: Vec<_> = (0..task_count)
+                    .map(|index| {
+                        spawn(move || {
+                            yield_now();
+                            batch * task_count + index
+                        })
+                    })
+                    .collect();
+                for child in children {
+                    total += child.join().expect("child task must not panic");
+                }
+            }
+            total
+        });
+
+        let expected: usize = (0..8 * task_count).sum();
+        assert_eq!(parent.join().expect("parent task must not panic"), expected);
+    }
+
+    // A panicking task still completes through `complete_current`, so its routine goes back to
+    // the pool and must run the next task normally.
+    #[test]
+    fn panicked_task_routine_is_reusable() {
+        for _ in 0..ROUTINE_POOL_CAPACITY * 2 {
+            let failed = spawn(|| -> u32 { panic!("boom") });
+            assert!(failed.join().is_err());
+
+            let ok = spawn(|| 7_u32);
+            assert_eq!(ok.join().expect("task must not panic"), 7);
         }
     }
 }

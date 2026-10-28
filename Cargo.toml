@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 crossbeam-deque = "0.8.6"
 libc = "0.2.189"
+
+[[bench]]
+name = "spawn_join"
+harness = false
