@@ -44,7 +44,9 @@ fn main() {
 
 ## How it works
 
-- Every task gets a 32 KiB `mmap`'d stack with a guard page below it.
+- Every task gets a 32 KiB `mmap`'d stack with a guard page below it. Stacks are attached when a
+  worker first runs the task and go back to that worker's pool (up to 64) when it finishes, so
+  most spawns reuse a stack instead of mapping a new one.
 - `swap_context` (`src/asm/aarch_macos.S`) saves the callee-saved registers and swaps the stack
   pointer.
 - One worker thread per CPU. New tasks go on a shared queue; once a task starts, it stays on that
